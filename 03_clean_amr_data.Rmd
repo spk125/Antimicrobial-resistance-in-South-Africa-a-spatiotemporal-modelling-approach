@@ -1,0 +1,286 @@
+---
+title: "Step 3 Clean AMR Data"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Load AMR CSV
+
+```{r}
+library(readr)
+library(dplyr)
+library(readxl)
+library(writexl)
+
+amr_path <- file.path("data", "sa_main_amr.csv")
+
+if (!file.exists(amr_path)) {
+  stop("Expected file not found: ", amr_path)
+}
+
+amr_data <- read_csv(amr_path, show_col_types = FALSE)
+amr_data
+```
+
+## Load facility bug-drug yearly summary
+
+```{r}
+facility_summary_path <- file.path("data", "Facility_BugDrug_YearlySummary.xlsx")
+
+if (!file.exists(facility_summary_path)) {
+  stop("Expected file not found: ", facility_summary_path)
+}
+
+facility_summary <- read_excel(facility_summary_path)
+facility_summary
+```
+
+## Load hospital tier data
+
+```{r}
+hospital_tier_path <- file.path("data", "Hospital_tier_final.xlsx")
+
+if (!file.exists(hospital_tier_path)) {
+  stop("Expected file not found: ", hospital_tier_path)
+}
+
+hospital_tier_data <- read_excel(hospital_tier_path)
+hospital_tier_data
+```
+
+## Normalize drug susceptibility columns
+
+This chunk standardizes drug result values to `Resistant` or `Sensitive` (case-insensitive) and sets anything else to `NA`.
+
+```{r}
+drug_cols <- c(
+  "meropenem", "imipenem", "doripenem",
+  "cefotaxime__ceftriaxone", "ceftazidime",
+  "cloxacillin", "ertapenem",
+  "gentamicin", "tobramycin", "amikacin", "netilmicin", "gentamicin___high_level_resistan",
+  "vancomycin", "teicoplanin"
+)
+
+amr_data_normalized <- amr_data %>%
+  mutate(across(
+    all_of(drug_cols),
+    ~ case_when(
+      toupper(as.character(.)) %in% c("RESISTANT", "INTERMEDIATE") ~ "Resistant",
+      toupper(as.character(.)) %in% c("SENSITIVE", "SENSITIVE DOSE DEPENDANT") ~ "Sensitive",
+      TRUE ~ NA_character_
+    )
+  ))
+
+amr_data_normalized
+```
+
+## Derive organism-specific resistance flags
+
+```{r}
+amr_data_flags <- amr_data_normalized %>%
+  mutate(
+    abaumanii_carbapenem = case_when(
+      eskape != "A. baumannii" ~ NA_character_,
+      rowSums(across(c(meropenem, imipenem, doripenem),
+                     ~ . == "Resistant"), na.rm = TRUE) > 0 ~ "Resistant",
+      rowSums(across(c(meropenem, imipenem, doripenem),
+                     ~ is.na(.)), na.rm = TRUE) == 3 ~ NA_character_,
+      TRUE ~ "Sensitive"
+    ),
+
+    ecoli_3gc = case_when(
+      eskape != "E. coli" ~ NA_character_,
+      rowSums(across(c(cefotaxime__ceftriaxone, ceftazidime),
+                     ~ . == "Resistant"), na.rm = TRUE) > 0 ~ "Resistant",
+      rowSums(across(c(cefotaxime__ceftriaxone, ceftazidime),
+                     ~ is.na(.)), na.rm = TRUE) == 2 ~ NA_character_,
+      TRUE ~ "Sensitive"
+    ),
+
+    saureus_penicillinase = case_when(
+      eskape != "S. aureus" ~ NA_character_,
+      cloxacillin == "Resistant" ~ "Resistant",
+      is.na(cloxacillin) ~ NA_character_,
+      TRUE ~ "Sensitive"
+    ),
+
+    kpneumoniae_carbapenem = case_when(
+      eskape != "K. pneumoniae" ~ NA_character_,
+      rowSums(across(c(meropenem, imipenem, ertapenem, doripenem),
+                     ~ . == "Resistant"), na.rm = TRUE) > 0 ~ "Resistant",
+      rowSums(across(c(meropenem, imipenem, ertapenem, doripenem),
+                     ~ is.na(.)), na.rm = TRUE) == 4 ~ NA_character_,
+      TRUE ~ "Sensitive"
+    ),
+
+    paeruginosa_aminoglycoside = case_when(
+      eskape != "P. aeruginosa" ~ NA_character_,
+      rowSums(across(c(gentamicin, tobramycin, amikacin, netilmicin,
+                       gentamicin___high_level_resistan),
+                     ~ . == "Resistant"), na.rm = TRUE) > 0 ~ "Resistant",
+      rowSums(across(c(gentamicin, tobramycin, amikacin, netilmicin,
+                       gentamicin___high_level_resistan),
+                     ~ is.na(.)), na.rm = TRUE) == 5 ~ NA_character_,
+      TRUE ~ "Sensitive"
+    ),
+
+    enterobacter_3gc = case_when(
+      eskape != "Enterobacter spp" ~ NA_character_,
+      rowSums(across(c(cefotaxime__ceftriaxone, ceftazidime),
+                     ~ . == "Resistant"), na.rm = TRUE) > 0 ~ "Resistant",
+      rowSums(across(c(cefotaxime__ceftriaxone, ceftazidime),
+                     ~ is.na(.)), na.rm = TRUE) == 2 ~ NA_character_,
+      TRUE ~ "Sensitive"
+    ),
+
+    efaecium_glycopeptide = case_when(
+      eskape != "E. faecium" ~ NA_character_,
+      rowSums(across(c(vancomycin, teicoplanin),
+                     ~ . == "Resistant"), na.rm = TRUE) > 0 ~ "Resistant",
+      rowSums(across(c(vancomycin, teicoplanin),
+                     ~ is.na(.)), na.rm = TRUE) == 2 ~ NA_character_,
+      TRUE ~ "Sensitive"
+    ),
+
+    efaecalis_glycopeptide = case_when(
+      eskape != "E. faecalis" ~ NA_character_,
+      rowSums(across(c(vancomycin, teicoplanin),
+                     ~ . == "Resistant"), na.rm = TRUE) > 0 ~ "Resistant",
+      rowSums(across(c(vancomycin, teicoplanin),
+                     ~ is.na(.)), na.rm = TRUE) == 2 ~ NA_character_,
+      TRUE ~ "Sensitive"
+    )
+  )
+
+amr_data_flags
+```
+
+## Select final columns
+
+```{r}
+cols_to_keep <- c(
+  "unique_patient_id",
+  "taken_date",
+  "organism_name",
+  "episode_no",
+  "folder_no",
+  "gender",
+  "date_of_birth",
+  "facility_name",
+  "facility_latitude",
+  "facility_longitude",
+  "province_name",
+  "district_name",
+  "ward_name",
+  "ward_description",
+  "referring_lab_name",
+  "testing_lab_name",
+  "lab_latitude",
+  "lab_longitude",
+  "registered_date",
+  "tested_date",
+  "reviewed_date",
+  "eskape",
+  "organism",
+  "date_taken",
+  "year_taken",
+  "month",
+  "abaumanii_carbapenem",
+  "ecoli_3gc",
+  "saureus_penicillinase",
+  "kpneumoniae_carbapenem",
+  "paeruginosa_aminoglycoside",
+  "enterobacter_3gc",
+  "efaecium_glycopeptide",
+  "efaecalis_glycopeptide"
+)
+
+amr_data_final <- amr_data_flags %>%
+  select(all_of(cols_to_keep))
+
+amr_data_final
+```
+
+## Add hospital tier
+
+```{r}
+amr_data_final <- amr_data_final %>%
+  left_join(
+    hospital_tier_data %>% select(facility_name, hospital_tier),
+    by = "facility_name"
+  )
+
+# Verify the join
+amr_data_final %>%
+  select(facility_name, hospital_tier) %>%
+  distinct() %>%
+  head()
+
+head(amr_data_final)
+```
+
+## Column names
+
+```{r}
+colnames(amr_data_final)
+```
+
+## Districts in facility summary
+```{r}
+distinct_districts <- facility_summary %>%
+  distinct(district_name, district_code)
+distinct_districts
+
+```
+
+## Add district codes to AMR data
+
+```{r}
+amr_data_final <- amr_data_final %>%
+  left_join(
+    distinct_districts,
+    by = "district_name"
+  )
+
+head(amr_data_final)
+```
+
+## Drop rows without a district code
+```{r}
+amr_data_final <- amr_data_final %>%
+  filter(!is.na(district_code) & trimws(district_code) != "")
+```
+
+
+## Save cleaned AMR data
+```{r}
+print(colnames(amr_data_final))
+```
+
+## Rows missing district code
+```{r}
+amr_data_final %>%
+  filter(is.na(district_code) | trimws(district_code) == "") %>%
+  print(n = Inf)
+```
+
+
+
+
+## Drop rows without a district code
+```{r}
+amr_data_final <- amr_data_final %>%
+  filter(!is.na(district_code) & trimws(district_code) != "")
+  
+```
+
+
+## Save cleaned AMR data to Excel
+```{r}
+output_path <- file.path("data", "step3_cleanedAMRdata_output.xlsx")
+write_xlsx(amr_data_final, output_path)
+output_path
+```

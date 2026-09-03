@@ -1,0 +1,563 @@
+---
+title: "Step 2 Imputation (missForest)"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Load packages and Step 1 data
+
+```{r}
+library(readxl)
+library(dplyr)
+library(missForest)
+library(mgcv)
+library(zoo)
+library(ggplot2)
+
+# Path to the cleaned dataset from Step 1
+data_path <- file.path("data", "step1_datapreparation_output.xlsx")
+
+if (!file.exists(data_path)) {
+  stop("Expected file not found: ", data_path, ". Run step1_datapreparation first.")
+}
+
+step1_data <- read_xlsx(data_path)
+step1_data
+```
+
+```{r}
+# Helper: clean names with janitor if available, otherwise fall back to base
+clean_names_safe <- function(x) {
+  if (requireNamespace("janitor", quietly = TRUE)) {
+    return(janitor::make_clean_names(x))
+  }
+  message("Package 'janitor' not installed; using base::make.names().")
+  make.names(x, unique = TRUE)
+}
+```
+
+## Get South Africa district boundaries (GADM level 2)
+
+This chunk downloads the South Africa GADM level-2 (district) boundaries, stores them under `data/spatial`, and returns an sf object `sa_gadm2_sf`.
+
+```{r}
+if (!dir.exists("data/spatial")) dir.create("data/spatial", recursive = TRUE)
+
+library(geodata)
+library(sf)
+
+gadm_v <- geodata::gadm("ZAF", level = 2, path = "data/spatial")  # SpatVector
+sa_gadm2_sf <- sf::st_as_sf(gadm_v)
+
+sa_gadm2_sf
+```
+
+## Compute centroids and merge lon/lat into Step 1 data
+
+```{r}
+district_centroids <- sa_gadm2_sf %>%
+  dplyr::rename(district_code = CC_2) %>%      # CC_2 holds the district code
+  sf::st_centroid() %>%
+  dplyr::mutate(
+    lon = sf::st_coordinates(.)[, 1],
+    lat = sf::st_coordinates(.)[, 2]
+  ) %>%
+  sf::st_drop_geometry() %>%
+  dplyr::select(district_code, lon, lat)
+
+step1_data_with_coords <- step1_data %>%
+  dplyr::left_join(district_centroids, by = "district_code")
+
+head(step1_data_with_coords)
+```
+
+```{r}
+
+
+# Count records per district_code
+step1_data_with_coords %>%
+  dplyr::count(district_code, sort = TRUE)
+
+
+
+#print(step1_data_with_coords)
+```
+
+
+### Check district/year coverage (2013 and 2023)
+
+```{r}
+required_years <- c(2013, 2023)
+all_districts <- unique(district_centroids$district_code)
+
+expected_pairs <- expand.grid(
+  district_code = all_districts,
+  year = required_years,
+  KEEP.OUT.ATTRS = FALSE,
+  stringsAsFactors = FALSE
+)
+
+observed_pairs <- step1_data_with_coords %>%
+  dplyr::select(district_code, year) %>%
+  dplyr::distinct()
+
+missing_pairs <- expected_pairs %>%
+  dplyr::anti_join(observed_pairs, by = c("district_code", "year"))
+
+if (nrow(missing_pairs) == 0) {
+  message("All district codes present for years 2013 and 2023.")
+} else {
+  message("Missing district/year combinations for 2013 or 2023:")
+  print(missing_pairs)
+}
+```
+
+## Column names of the merged data
+
+```{r}
+# Count records per district_code
+step1_data_with_coords %>%
+  dplyr::count(district_code, sort = TRUE)
+
+
+```
+
+## Impute missing values with GAM (spatio-temporal)
+
+We fit a GAM for each variable (lon/lat/year smooth), impute missing values, then do a final linear interpolation over time within districts.
+
+```{r}
+# Variables with >=3 years of sufficient coverage
+variables_ge3_years <- c(
+  "Hospital beds per 10 000 target population (rescaled)",
+  "Antenatal client initiated on ART rate",
+  "Diarrhoea case fatality under 5 years rate",
+  "Hospital beds per 10 000 target population",
+  "Pneumonia case fatality under 5 years rate",
+  "Severe acute malnutrition case fatality under 5 years rate",
+  "ART Adult client viral load done (VLD)",
+  "Adult ART Total",
+  "Medical practitioners per 100 000 population",
+  "No of households",
+  "Percentage of households with access to improved sanitation (index)",
+  "Pharmacists per 100 000 population",
+  "Population.y",
+  "Clients remaining on ART rate",
+  "Delivery by Caesarean section rate (district hospitals)",
+  "Proportion of health facilities with essential medicines",
+  "Tracer items stock-out rate (fixed clinic/CHC/CDC)",
+  "Antenatal client HIV 1st test positive",
+  "Antenatal client known HIV positive but NOT on ART at 1st visit",
+  "HIV test positive 15 years and older (excl ANC)",
+  "Death under 5 years against live birth rate",
+  "Access to services (Electricity)",
+  "Access to services (Sewerage and sanitation)",
+  "Access to services (Solid waste management)",
+  "Access to services (Water)",
+  "Acute malnutrition under five",
+  "Adult literacy",
+  "GDPR per capita",
+  "Gini coefficient",
+  "Human Development Index",
+  "Immunisation rate",
+  "Infant mortality",
+  "Low Birth Weight",
+  "Mean years of schooling",
+  "Patients remaining on ART",
+  "Patients starting ART treatment",
+  "Under five mortality",
+  "Expected years of schooling",
+  "HIV test positive client 15 years and older rate (incl ANC)",
+  "Maternal mortality"
+)
+
+# Build data for imputation: predictors (year, lon, lat) + targets
+final_data_with_coords <- step1_data_with_coords %>%
+  dplyr::select(
+    district_code,
+    year,
+    lon,
+    lat,
+    dplyr::all_of(variables_ge3_years)
+  )
+
+# Clean names for modeling and keep a map back to originals
+clean_name_map <- data.frame(
+  orig = c("district_code", "year", "lon", "lat", variables_ge3_years),
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::mutate(clean = clean_names_safe(orig))
+
+vars_to_impute <- setdiff(clean_name_map$clean, c("district_code", "year", "lon", "lat"))
+if (length(vars_to_impute) == 0) stop("No variables available for imputation.")
+
+gam_df <- final_data_with_coords %>%
+  dplyr::rename_with(.fn = clean_names_safe) %>%
+  dplyr::select(dplyr::all_of(clean_name_map$clean))
+
+set.seed(123)
+for (v in vars_to_impute) {
+  message("Imputing with GAM: ", v)
+  obs <- gam_df %>% dplyr::filter(!is.na(.data[[v]]))
+  if (nrow(obs) < 10) {
+    message("  • skipping ", v, "; only ", nrow(obs), " obs")
+    next
+  }
+  k_year <- min(5, length(unique(obs$year)))
+  k_spatial <- 10
+  f_str <- sprintf("%s ~ te(lon, lat, year, k = c(%d,%d,%d))", v, k_spatial, k_spatial, k_year)
+  fm <- as.formula(f_str)
+  m <- mgcv::gam(fm, data = obs, method = "REML")
+  preds <- predict(m, newdata = gam_df)
+  gam_df[[v]] <- ifelse(is.na(gam_df[[v]]), preds, gam_df[[v]])
+}
+
+# Final temporal interpolation within districts
+gam_df <- gam_df %>%
+  dplyr::arrange(district_code, year) %>%
+  dplyr::group_by(district_code) %>%
+  dplyr::mutate(across(
+    dplyr::all_of(vars_to_impute),
+    ~ zoo::na.approx(.x, x = year, na.rm = FALSE, rule = 2)
+  )) %>%
+  dplyr::ungroup()
+
+# Rename back to original column names
+name_map <- stats::setNames(clean_name_map$orig, clean_name_map$clean)
+
+final_imputed_gam <- gam_df %>%
+  dplyr::rename_with(.cols = intersect(names(name_map), names(gam_df)), .fn = ~ name_map[.x])
+
+head(final_imputed_gam)
+```
+
+## Check for remaining missing values
+```{r}
+colSums(is.na(final_imputed_gam))
+```
+
+
+```{r}
+# Count records per district_code
+final_imputed_gam %>%
+  dplyr::count(district_code, sort = TRUE)
+```
+
+
+## Save imputed dataset
+```{r}
+output_path <- file.path("data", "step2_imputation_gam_output.xlsx")
+write_xlsx(final_imputed_gam, output_path)
+output_path
+```
+
+## Impute missing values with missForest (for comparison)
+
+```{r}
+mf_data <- final_data_with_coords %>%
+  dplyr::select(year, lon, lat, dplyr::all_of(variables_ge3_years)) %>%
+  as.data.frame()
+
+set.seed(123)
+mf_result <- missForest(
+  xmis         = mf_data,
+  maxiter      = 10,
+  ntree        = 100,
+  variablewise = FALSE,
+  verbose      = TRUE
+)
+
+completed_mf <- mf_result$ximp
+
+final_imputed_mf <- final_data_with_coords %>%
+  dplyr::select(-dplyr::all_of(variables_ge3_years)) %>%
+  dplyr::bind_cols(completed_mf %>% dplyr::select(dplyr::all_of(variables_ge3_years)))
+
+# Save missForest version separately
+output_path_mf <- file.path("data", "step2_imputation_missforest_output_mf.xlsx")
+write_xlsx(final_imputed_mf, output_path_mf)
+output_path_mf
+```
+
+## Flag spikes using robust z-score (MAD) by district
+
+This chunk flags records where |z| > 3 using median/MAD within each district and variable.
+
+```{r}
+flag_mad_spikes <- function(df, dataset_label, out_dir) {
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  long_df <- df %>%
+    pivot_longer(
+      cols = -c(district_code, year),
+      names_to = "variable",
+      values_to = "value"
+    ) %>%
+    group_by(district_code, variable) %>%
+    mutate(
+      med = median(value, na.rm = TRUE),
+      mad = stats::mad(value, constant = 1, na.rm = TRUE),
+      z_mad = ifelse(mad == 0 | is.na(mad), NA_real_, (value - med) / mad),
+      is_spike = !is.na(z_mad) & abs(z_mad) > 3
+    ) %>%
+    ungroup()
+
+  spikes <- long_df %>%
+    filter(is_spike) %>%
+    arrange(district_code, variable, year)
+
+  write.csv(
+    spikes,
+    file = file.path(out_dir, paste0("mad_spikes_", dataset_label, ".csv")),
+    row.names = FALSE
+  )
+
+  spikes
+}
+
+spikes_gam <- flag_mad_spikes(final_imputed_gam, "final_imputed_gam", file.path("data", "checks"))
+spikes_mf  <- flag_mad_spikes(final_imputed_mf,  "final_imputed_mf",  file.path("data", "checks"))
+
+spikes_gam
+spikes_mf
+
+mad_spike_counts <- function(df) {
+  df %>%
+    pivot_longer(
+      cols = -c(district_code, year),
+      names_to = "variable",
+      values_to = "value"
+    ) %>%
+    group_by(district_code, variable) %>%
+    mutate(
+      med = median(value, na.rm = TRUE),
+      mad = stats::mad(value, constant = 1, na.rm = TRUE),
+      z_mad = ifelse(mad == 0 | is.na(mad), NA_real_, (value - med) / mad),
+      is_spike = !is.na(z_mad) & abs(z_mad) > 3
+    ) %>%
+    ungroup() %>%
+    count(is_spike)
+}
+
+mad_spike_counts(final_imputed_gam)
+mad_spike_counts(final_imputed_mf)
+
+mad_spikes_by_variable <- function(df) {
+  df %>%
+    pivot_longer(
+      cols = -c(district_code, year),
+      names_to = "variable",
+      values_to = "value"
+    ) %>%
+    group_by(district_code, variable) %>%
+    mutate(
+      med = median(value, na.rm = TRUE),
+      mad = stats::mad(value, constant = 1, na.rm = TRUE),
+      z_mad = ifelse(mad == 0 | is.na(mad), NA_real_, (value - med) / mad),
+      is_spike = !is.na(z_mad) & abs(z_mad) > 3
+    ) %>%
+    ungroup() %>%
+    filter(is_spike) %>%
+    count(variable, sort = TRUE)
+}
+
+spike_vars_gam <- mad_spikes_by_variable(final_imputed_gam)
+spike_vars_mf  <- mad_spikes_by_variable(final_imputed_mf)
+
+spike_vars_gam
+spike_vars_mf
+```
+
+```{r}
+# Counts for GAM
+spikes_gam %>%
+  dplyr::count(is_spike)
+
+# Counts for missForest
+spikes_mf %>%
+  dplyr::count(is_spike)
+```
+
+
+
+
+## Save line charts per variable and district
+
+This chunk saves one PNG per variable for each imputed dataset. Each chart shows district lines across years.
+
+```{r}
+install.packages("ggplot2")
+
+```
+
+```{r}
+library(ggplot2)
+
+plot_district_lines <- function(df, vars, dataset_label, out_dir) {
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  for (v in vars) {
+    p <- ggplot(df, aes(x = year, y = .data[[v]], group = district_code, color = district_code)) +
+      geom_line(alpha = 0.6, linewidth = 0.5) +
+      labs(
+        title = paste0(dataset_label, ": ", v),
+        x = "Year",
+        y = v,
+        color = "District"
+      ) +
+      theme_minimal() +
+      theme(legend.position = "none")
+    file_name <- paste0(
+      dataset_label,
+      "_",
+      gsub("[^A-Za-z0-9_]+", "_", v),
+      ".png"
+    )
+    ggsave(
+      filename = file.path(out_dir, file_name),
+      plot = p,
+      width = 10,
+      height = 6,
+      dpi = 300
+    )
+  }
+}
+
+plot_district_lines(
+  final_imputed_gam,
+  variables_ge3_years,
+  "final_imputed_gam",
+  file.path("data", "checks")
+)
+
+plot_district_lines(
+  final_imputed_mf,
+  variables_ge3_years,
+  "final_imputed_mf",
+  file.path("data", "checks")
+)
+```
+
+## Correlation screening and drop suggestions
+
+This chunk flags highly correlated predictor pairs and suggests a variable to drop based on higher missingness in the pre-imputation data.
+
+```{r}
+find_high_corr <- function(df, vars, threshold = 0.85) {
+  corr_mat <- cor(df[, vars], use = "pairwise.complete.obs")
+  idx <- which(abs(corr_mat) >= threshold & abs(corr_mat) < 1, arr.ind = TRUE)
+  if (nrow(idx) == 0) {
+    return(data.frame())
+  }
+  data.frame(
+    var1 = rownames(corr_mat)[idx[, 1]],
+    var2 = colnames(corr_mat)[idx[, 2]],
+    corr = corr_mat[idx],
+    stringsAsFactors = FALSE
+  ) %>%
+    dplyr::mutate(pair = paste(pmin(var1, var2), pmax(var1, var2), sep = " | ")) %>%
+    dplyr::distinct(pair, .keep_all = TRUE) %>%
+    dplyr::select(-pair) %>%
+    dplyr::arrange(dplyr::desc(abs(corr)))
+}
+
+suggest_drop <- function(pairs_df, missing_rate) {
+  if (nrow(pairs_df) == 0) return(pairs_df)
+  pairs_df %>%
+    dplyr::rowwise() %>%
+    dplyr::mutate(
+      miss_var1 = missing_rate[var1],
+      miss_var2 = missing_rate[var2],
+      suggested_drop = dplyr::case_when(
+        is.na(miss_var1) & is.na(miss_var2) ~ NA_character_,
+        miss_var1 > miss_var2 ~ var1,
+        miss_var2 > miss_var1 ~ var2,
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    dplyr::ungroup()
+}
+
+# Missingness rates from pre-imputation data
+missing_rate <- sapply(final_data_with_coords[, variables_ge3_years], function(x) mean(is.na(x)))
+
+# High-correlation pairs for each imputed dataset
+high_corr_gam <- find_high_corr(final_imputed_gam, variables_ge3_years, threshold = 0.85)
+high_corr_mf  <- find_high_corr(final_imputed_mf,  variables_ge3_years, threshold = 0.85)
+
+high_corr_gam
+high_corr_mf
+
+# Drop suggestions based on higher pre-imputation missingness
+drop_suggestions_gam <- suggest_drop(high_corr_gam, missing_rate)
+drop_suggestions_mf  <- suggest_drop(high_corr_mf,  missing_rate)
+
+drop_suggestions_gam
+drop_suggestions_mf
+
+# Save drop suggestions (without suggested_drop column)
+dir.create(file.path("data", "checks"), recursive = TRUE, showWarnings = FALSE)
+
+drop_suggestions_gam %>%
+  dplyr::select(-suggested_drop) %>%
+  write.csv(
+    file = file.path("data", "checks", "drop_suggestions_gam.csv"),
+    row.names = FALSE
+  )
+
+drop_suggestions_mf %>%
+  dplyr::select(-suggested_drop) %>%
+  write.csv(
+    file = file.path("data", "checks", "drop_suggestions_mf.csv"),
+    row.names = FALSE
+  )
+```
+
+## Compare GAM vs missForest imputations
+
+```{r}
+common_cols <- intersect(names(final_imputed_gam), names(final_imputed_mf))
+num_cols <- common_cols[sapply(final_imputed_gam[common_cols], is.numeric)]
+
+diff_counts <- sapply(num_cols, function(col) {
+  sum(abs(final_imputed_gam[[col]] - final_imputed_mf[[col]]) > 1e-8, na.rm = TRUE)
+})
+
+total_diff <- sum(diff_counts)
+
+message("Total numeric cells differing between GAM and missForest: ", total_diff)
+print(diff_counts)
+```
+
+## Drop selected columns from both imputed datasets
+
+```{r}
+cols_to_drop <- c(
+  "Access to services (Solid waste management)",
+  "Access to services (Electricity)",
+  "Antenatal client known HIV positive but NOT on ART at 1st visit",
+  "ART Adult client viral load done (VLD)"
+)
+
+final_imputed_gam <- final_imputed_gam %>%
+  dplyr::select(-dplyr::all_of(cols_to_drop))
+
+final_imputed_mf <- final_imputed_mf %>%
+  dplyr::select(-dplyr::all_of(cols_to_drop))
+
+final_imputed_gam
+final_imputed_mf
+```
+
+## Re-save outputs after dropping columns
+
+```{r}
+output_path <- file.path("data", "step2_imputation_gam_output.xlsx")
+write_xlsx(final_imputed_gam, output_path)
+output_path
+
+output_path_mf <- file.path("data", "step2_imputation_missforest_output_mf.xlsx")
+write_xlsx(final_imputed_mf, output_path_mf)
+output_path_mf
+```
